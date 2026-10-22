@@ -2,13 +2,12 @@
 
 from typing import Any, Final, override
 
-from bsblan import BSBLANError, EntityInfo, State, get_hvac_action_category
+from bsblan import BSBLANError, State, StaticState, get_hvac_action_category
 
 from homeassistant.components.climate import (
     ATTR_HVAC_MODE,
-    ATTR_PRESET_MODE,
+    PRESET_COMFORT,
     PRESET_ECO,
-    PRESET_NONE,
     ClimateEntity,
     ClimateEntityFeature,
     HVACAction,
@@ -21,8 +20,9 @@ from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import BSBLanConfigEntry, BSBLanData
-from .const import ATTR_TARGET_TEMPERATURE, DOMAIN
+from .const import DOMAIN
 from .entity import BSBLanCircuitEntity
+from .helpers import first_temperature, validate_setpoint_order
 
 PARALLEL_UPDATES = 1
 
@@ -33,33 +33,43 @@ HVAC_MODES = [
 ]
 
 PRESET_MODES = [
+    PRESET_COMFORT,
     PRESET_ECO,
-    PRESET_NONE,
 ]
+
+BSBLAN_AUTOMATIC_MODE: Final = 1
 
 # Mapping from Home Assistant HVACMode to BSB-LAN integer values
 # BSB-LAN uses: 0=off, 1=auto, 2=eco/reduced, 3=heat/comfort
 HA_TO_BSBLAN_HVAC_MODE: Final[dict[HVACMode, int]] = {
     HVACMode.OFF: 0,
-    HVACMode.AUTO: 1,
+    HVACMode.AUTO: BSBLAN_AUTOMATIC_MODE,
     HVACMode.HEAT: 3,
 }
 
 # Mapping from BSB-LAN integer values to Home Assistant HVACMode
 BSBLAN_TO_HA_HVAC_MODE: Final[dict[int, HVACMode]] = {
     0: HVACMode.OFF,
-    1: HVACMode.AUTO,
-    2: HVACMode.AUTO,  # eco/reduced maps to AUTO with preset
+    BSBLAN_AUTOMATIC_MODE: HVACMode.AUTO,
+    2: HVACMode.HEAT,  # permanent reduced, exposed as HEAT with the eco preset
     3: HVACMode.HEAT,
 }
 
+# Outside automatic mode, a preset switches the permanent operating mode
+PRESET_TO_BSBLAN_HVAC_MODE: Final[dict[str, int]] = {
+    PRESET_COMFORT: 3,
+    PRESET_ECO: 2,
+}
+BSBLAN_HVAC_MODE_TO_PRESET: Final[dict[int, str]] = {
+    v: k for k, v in PRESET_TO_BSBLAN_HVAC_MODE.items()
+}
 
-def _resolve_temperature_bound(*sources: EntityInfo[float] | None) -> float | None:
-    """Return the first usable temperature bound from the given sources."""
-    for source in sources:
-        if source is not None and source.value is not None:
-            return source.value
-    return None
+# In automatic mode, a preset overrides the time program until its next
+# switch point (0=no override, 1=reduced, 2=comfort)
+PRESET_TO_BSBLAN_TEMPORARY_MODE: Final[dict[str, int]] = {
+    PRESET_COMFORT: 2,
+    PRESET_ECO: 1,
+}
 
 
 async def async_setup_entry(
@@ -95,7 +105,7 @@ class BSBLANClimate(BSBLanCircuitEntity, ClimateEntity):
         circuit: int,
     ) -> None:
         """Initialize BSBLAN climate device."""
-        super().__init__(data.fast_coordinator, data, circuit)
+        super().__init__(data.fast_coordinator, data.slow_coordinator, data, circuit)
         self._circuit = circuit
         mac = format_mac(data.device.MAC)
 
@@ -113,13 +123,13 @@ class BSBLANClimate(BSBLanCircuitEntity, ClimateEntity):
         # only on PPS devices. Inactive parameters ("---") have value None.
         if (static := data.static.get(circuit)) is not None:
             if (
-                min_temp := _resolve_temperature_bound(
+                min_temp := first_temperature(
                     static.heating_protective_setpoint, static.min_temp
                 )
             ) is not None:
                 self._attr_min_temp = min_temp
             if (
-                max_temp := _resolve_temperature_bound(
+                max_temp := first_temperature(
                     static.comfort_setpoint_max, static.max_temp
                 )
             ) is not None:
@@ -134,6 +144,27 @@ class BSBLANClimate(BSBLanCircuitEntity, ClimateEntity):
         return self.coordinator.data.states[self._circuit]
 
     @property
+    def _circuit_config(self) -> StaticState | None:
+        """Return the slow-polled config for this circuit."""
+        return (
+            self.slow_coordinator.data.heating_config.get(self._circuit)
+            if self.slow_coordinator.data
+            else None
+        )
+
+    @property
+    def _comfort_setpoint(self) -> float | None:
+        """Return the comfort setpoint."""
+        return first_temperature(self._circuit_state.target_temperature)
+
+    @property
+    def _reduced_setpoint(self) -> float | None:
+        """Return the reduced setpoint."""
+        if (config := self._circuit_config) is None:
+            return None
+        return first_temperature(config.temp_reduced_setpoint)
+
+    @property
     @override
     def native_current_temperature(self) -> float | None:
         """Return the current temperature."""
@@ -144,10 +175,9 @@ class BSBLANClimate(BSBLanCircuitEntity, ClimateEntity):
     @property
     @override
     def native_target_temperature(self) -> float | None:
-        """Return the temperature we try to reach."""
-        if (target_temp := self._circuit_state.target_temperature) is None:
-            return None
-        return target_temp.value
+        """Return the setpoint the controller currently applies."""
+        state = self._circuit_state
+        return first_temperature(state.current_setpoint, state.target_temperature)
 
     @property
     def _hvac_mode_value(self) -> int | None:
@@ -176,46 +206,84 @@ class BSBLANClimate(BSBLanCircuitEntity, ClimateEntity):
     @property
     @override
     def preset_mode(self) -> str | None:
-        """Return the current preset mode."""
-        # BSB-LAN mode 2 is eco/reduced mode
-        if self._hvac_mode_value == 2:
+        """Return the comfort level currently in effect."""
+        if (hvac_mode_value := self._hvac_mode_value) is None:
+            return None
+        if hvac_mode_value != BSBLAN_AUTOMATIC_MODE:
+            return BSBLAN_HVAC_MODE_TO_PRESET.get(hvac_mode_value)
+        if (current := first_temperature(self._circuit_state.current_setpoint)) is None:
+            return None
+        if current == self._comfort_setpoint:
+            return PRESET_COMFORT
+        if current == self._reduced_setpoint:
             return PRESET_ECO
-        return PRESET_NONE
+        return None
 
     @override
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set hvac mode."""
-        await self.async_set_data(hvac_mode=hvac_mode)
+        await self._async_thermostat(hvac_mode=HA_TO_BSBLAN_HVAC_MODE[hvac_mode])
 
     @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set preset mode."""
-        await self.async_set_data(preset_mode=preset_mode)
+        if self._hvac_mode_value == BSBLAN_AUTOMATIC_MODE:
+            await self._async_thermostat(
+                temporary_mode=PRESET_TO_BSBLAN_TEMPORARY_MODE[preset_mode]
+            )
+        else:
+            await self._async_thermostat(
+                hvac_mode=PRESET_TO_BSBLAN_HVAC_MODE[preset_mode]
+            )
 
     @override
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperatures."""
-        await self.async_set_data(**kwargs)
+        """Set the setpoint of the comfort level currently in effect."""
+        temperature = kwargs[ATTR_TEMPERATURE]
+        hvac_mode = kwargs.get(ATTR_HVAC_MODE)
+        # Switching to heat or off leaves automatic mode, so the comfort
+        # setpoint is the one to write
+        reduced = hvac_mode in (None, HVACMode.AUTO) and (
+            self.preset_mode == PRESET_ECO
+        )
+        self._validate_setpoint(temperature, reduced=reduced)
+        if hvac_mode is not None:
+            await self.async_set_hvac_mode(hvac_mode)
+        await self._async_set_setpoint(temperature, reduced=reduced)
 
-    async def async_set_data(self, **kwargs: Any) -> None:
-        """Set device settings using BSBLAN."""
-        data: dict[str, Any] = {}
-        if ATTR_TEMPERATURE in kwargs:
-            data[ATTR_TARGET_TEMPERATURE] = kwargs[ATTR_TEMPERATURE]
-        if ATTR_HVAC_MODE in kwargs:
-            data[ATTR_HVAC_MODE] = HA_TO_BSBLAN_HVAC_MODE[kwargs[ATTR_HVAC_MODE]]
-        if ATTR_PRESET_MODE in kwargs:
-            # eco preset uses BSB-LAN mode 2, none preset uses mode 1 (auto)
-            if kwargs[ATTR_PRESET_MODE] == PRESET_ECO:
-                data[ATTR_HVAC_MODE] = 2
-            elif kwargs[ATTR_PRESET_MODE] == PRESET_NONE:
-                data[ATTR_HVAC_MODE] = 1
+    def _validate_setpoint(self, temperature: float, *, reduced: bool) -> None:
+        """Keep the reduced setpoint at or below the comfort setpoint."""
+        if reduced:
+            validate_setpoint_order(
+                temperature, "reduced_above_comfort", maximum=self._comfort_setpoint
+            )
+        else:
+            validate_setpoint_order(
+                temperature, "comfort_below_reduced", minimum=self._reduced_setpoint
+            )
 
+    async def _async_set_setpoint(self, temperature: float, *, reduced: bool) -> None:
+        """Write the comfort or reduced setpoint."""
+        if reduced:
+            await self._async_thermostat(
+                temp_reduced_setpoint=temperature, refresh_config=True
+            )
+        else:
+            await self._async_thermostat(target_temperature=temperature)
+
+    async def _async_thermostat(
+        self, *, refresh_config: bool = False, **kwargs: Any
+    ) -> None:
+        """Write a thermostat parameter, then refresh the state."""
         try:
-            await self.coordinator.client.thermostat(**data, circuit=self._circuit)
+            await self.coordinator.client.thermostat(**kwargs, circuit=self._circuit)
         except BSBLANError as err:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
                 translation_key="set_data_error",
             ) from err
+        # The config holds the reduced setpoint, refresh it before the state
+        # so the comfort level in effect is derived from up-to-date values
+        if refresh_config:
+            await self.slow_coordinator.async_refresh()
         await self.coordinator.async_refresh_circuit(self._circuit)

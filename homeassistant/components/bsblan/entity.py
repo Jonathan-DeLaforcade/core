@@ -35,36 +35,6 @@ class BSBLanEntity(BSBLanEntityBase[BSBLanFastCoordinator]):
         super().__init__(coordinator, data)
 
 
-class BSBLanCircuitEntity(BSBLanEntity):
-    """BSBLan entity belonging to a heating circuit sub-device."""
-
-    def __init__(
-        self,
-        coordinator: BSBLanFastCoordinator,
-        data: BSBLanData,
-        circuit: int,
-    ) -> None:
-        """Initialize BSBLan circuit entity with sub-device info."""
-        super().__init__(coordinator, data)
-        mac = data.device.MAC
-        host = coordinator.config_entry.data[CONF_HOST]
-        port = coordinator.config_entry.data.get(CONF_PORT, DEFAULT_PORT)
-        main_info = get_bsblan_device_info(data.device, data.info, host, port)
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{mac}-circuit-{circuit}")},
-            translation_key="heating_circuit",
-            translation_placeholders={"circuit": str(circuit)},
-            via_device_id=dr.async_get_device_id_by_identifier(
-                coordinator.hass,
-                (DOMAIN, mac),
-                config_entry_id=coordinator.config_entry.entry_id,
-            ),
-            manufacturer=main_info.manufacturer,
-            model=main_info.model,
-            model_id=main_info.model_id,
-        )
-
-
 class BSBLanDualCoordinatorEntity(BSBLanEntity):
     """Entity that listens to both fast and slow coordinators."""
 
@@ -85,6 +55,37 @@ class BSBLanDualCoordinatorEntity(BSBLanEntity):
         # Also listen to slow coordinator updates
         self.async_on_remove(
             self.slow_coordinator.async_add_listener(self._handle_coordinator_update)
+        )
+
+
+class BSBLanCircuitEntity(BSBLanDualCoordinatorEntity):
+    """BSBLan entity belonging to a heating circuit sub-device."""
+
+    def __init__(
+        self,
+        fast_coordinator: BSBLanFastCoordinator,
+        slow_coordinator: BSBLanSlowCoordinator,
+        data: BSBLanData,
+        circuit: int,
+    ) -> None:
+        """Initialize BSBLan circuit entity with sub-device info."""
+        super().__init__(fast_coordinator, slow_coordinator, data)
+        mac = data.device.MAC
+        host = fast_coordinator.config_entry.data[CONF_HOST]
+        port = fast_coordinator.config_entry.data.get(CONF_PORT, DEFAULT_PORT)
+        main_info = get_bsblan_device_info(data.device, data.info, host, port)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{mac}-circuit-{circuit}")},
+            translation_key="heating_circuit",
+            translation_placeholders={"circuit": str(circuit)},
+            via_device_id=dr.async_get_device_id_by_identifier(
+                fast_coordinator.hass,
+                (DOMAIN, mac),
+                config_entry_id=fast_coordinator.config_entry.entry_id,
+            ),
+            manufacturer=main_info.manufacturer,
+            model=main_info.model,
+            model_id=main_info.model_id,
         )
 
 

@@ -1,11 +1,44 @@
 """Helper functions for BSB-Lan integration."""
 
-from bsblan import BSBLAN, BSBLANError
+from bsblan import BSBLAN, BSBLANError, EntityInfo
 
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+
+
+def first_temperature(*sources: EntityInfo[float] | None) -> float | None:
+    """Return the first usable temperature from the given sources."""
+    for source in sources:
+        if source is not None and source.value is not None:
+            return source.value
+    return None
+
+
+def validate_setpoint_order(
+    temperature: float,
+    translation_key: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> None:
+    """Raise if a setpoint would cross the setpoint it is paired with.
+
+    The controller accepts a reduced setpoint above the comfort or nominal
+    one, so the order is enforced here.
+    """
+    if minimum is not None and temperature < minimum:
+        limit = minimum
+    elif maximum is not None and temperature > maximum:
+        limit = maximum
+    else:
+        return
+    raise ServiceValidationError(
+        translation_domain=DOMAIN,
+        translation_key=translation_key,
+        translation_placeholders={"temperature": str(temperature), "limit": str(limit)},
+    )
 
 
 async def async_sync_device_time(client: BSBLAN, device_name: str) -> None:

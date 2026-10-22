@@ -2,7 +2,7 @@
 
 from typing import Any, override
 
-from bsblan import BSBLANError, HotWaterState, SetHotWaterParam
+from bsblan import BSBLANError, HotWaterConfig, HotWaterState, SetHotWaterParam
 
 from homeassistant.components.water_heater import (
     STATE_ECO,
@@ -20,6 +20,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BSBLanConfigEntry, BSBLanData
 from .const import DOMAIN
 from .entity import BSBLanWaterHeaterDeviceEntity
+from .helpers import first_temperature, validate_setpoint_order
 
 PARALLEL_UPDATES = 1
 
@@ -63,6 +64,7 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
     """Defines a BSBLAN water heater entity."""
 
     _attr_name = None
+    _attr_min_temp = 10.0
     _attr_operation_list = list(HA_TO_BSBLAN_OPERATION_MODE.keys())
     _attr_supported_features = (
         WaterHeaterEntityFeature.TARGET_TEMPERATURE
@@ -84,28 +86,6 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
 
     @property
     @override
-    def min_temp(self) -> float:
-        """Return the minimum temperature.
-
-        Derived from the slow-coordinator DHW config, which may still be
-        pending when the platform is set up. Falls back to the default until
-        the config becomes available.
-        """
-        dhw_config = (
-            self.slow_coordinator.data.dhw_config
-            if self.slow_coordinator.data
-            else None
-        )
-        if (
-            dhw_config is not None
-            and dhw_config.reduced_setpoint is not None
-            and dhw_config.reduced_setpoint.value is not None
-        ):
-            return dhw_config.reduced_setpoint.value
-        return 10.0  # Default minimum
-
-    @property
-    @override
     def max_temp(self) -> float:
         """Return the maximum temperature.
 
@@ -113,11 +93,7 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
         pending when the platform is set up. Falls back to the default until
         the config becomes available.
         """
-        dhw_config = (
-            self.slow_coordinator.data.dhw_config
-            if self.slow_coordinator.data
-            else None
-        )
+        dhw_config = self._dhw_config
         if (
             dhw_config is not None
             and dhw_config.nominal_setpoint_max is not None
@@ -135,6 +111,40 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
         dhw = self.coordinator.data.dhw
         assert dhw is not None
         return dhw
+
+    @property
+    def _dhw_config(self) -> HotWaterConfig | None:
+        """Return the slow-coordinator DHW config.
+
+        It may still be pending when the platform is set up.
+        """
+        return (
+            self.slow_coordinator.data.dhw_config
+            if self.slow_coordinator.data
+            else None
+        )
+
+    @property
+    def _nominal_setpoint(self) -> float | None:
+        """Return the nominal DHW setpoint."""
+        return first_temperature(self._dhw.nominal_setpoint)
+
+    @property
+    def _reduced_setpoint(self) -> float | None:
+        """Return the reduced DHW setpoint."""
+        if (dhw_config := self._dhw_config) is None:
+            return None
+        return first_temperature(dhw_config.reduced_setpoint)
+
+    @property
+    def _reduced_setpoint_active(self) -> bool:
+        """Return whether the controller currently applies the reduced setpoint."""
+        current = first_temperature(self._dhw.dhw_current_setpoint)
+        return (
+            current is not None
+            and current != self._nominal_setpoint
+            and current == self._reduced_setpoint
+        )
 
     @property
     @override
@@ -157,44 +167,29 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
     @property
     @override
     def native_target_temperature(self) -> float | None:
-        """Return the temperature we try to reach."""
-        if (target_temp := self._dhw.nominal_setpoint) is None:
-            return None
-        return target_temp.value
+        """Return the setpoint the controller currently applies."""
+        return first_temperature(
+            self._dhw.dhw_current_setpoint, self._dhw.nominal_setpoint
+        )
 
     @override
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature."""
-        temperature = kwargs.get(ATTR_TEMPERATURE)
-        try:
-            await self.coordinator.client.set_hot_water(
-                SetHotWaterParam(nominal_setpoint=temperature)
-            )
-        except BSBLANError as err:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="set_temperature_error",
-            ) from err
-
-        await self.coordinator.async_refresh_hot_water()
+        """Set the setpoint currently in effect."""
+        temperature = kwargs[ATTR_TEMPERATURE]
+        reduced = self._reduced_setpoint_active
+        self._validate_setpoint(temperature, reduced=reduced)
+        await self._async_set_setpoint(temperature, reduced=reduced)
 
     @override
     async def async_set_operation_mode(self, operation_mode: str) -> None:
         """Set new operation mode."""
         # Base class validates operation_mode is in operation_list before calling
         bsblan_mode = HA_TO_BSBLAN_OPERATION_MODE[operation_mode]
-        try:
-            # Send numeric value as string - BSB-LAN API expects numeric mode values
-            await self.coordinator.client.set_hot_water(
-                SetHotWaterParam(operating_mode=str(bsblan_mode))
-            )
-        except BSBLANError as err:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="set_operation_mode_error",
-            ) from err
-
-        await self.coordinator.async_refresh_hot_water()
+        # Send numeric value as string - BSB-LAN API expects numeric mode values
+        await self._async_set_hot_water(
+            SetHotWaterParam(operating_mode=str(bsblan_mode)),
+            "set_operation_mode_error",
+        )
 
     @override
     async def async_turn_on(self, **kwargs: Any) -> None:
@@ -205,3 +200,47 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the water heater off."""
         await self.async_set_operation_mode(STATE_OFF)
+
+    def _validate_setpoint(self, temperature: float, *, reduced: bool) -> None:
+        """Keep the reduced setpoint at or below the nominal setpoint."""
+        if reduced:
+            validate_setpoint_order(
+                temperature, "reduced_above_nominal", maximum=self._nominal_setpoint
+            )
+        else:
+            validate_setpoint_order(
+                temperature, "nominal_below_reduced", minimum=self._reduced_setpoint
+            )
+
+    async def _async_set_setpoint(self, temperature: float, *, reduced: bool) -> None:
+        """Write the nominal or reduced setpoint."""
+        if reduced:
+            await self._async_set_hot_water(
+                SetHotWaterParam(reduced_setpoint=temperature),
+                "set_temperature_error",
+                refresh_config=True,
+            )
+        else:
+            await self._async_set_hot_water(
+                SetHotWaterParam(nominal_setpoint=temperature),
+                "set_temperature_error",
+            )
+
+    async def _async_set_hot_water(
+        self,
+        params: SetHotWaterParam,
+        error_translation_key: str,
+        *,
+        refresh_config: bool = False,
+    ) -> None:
+        """Write a hot water parameter, then refresh the state."""
+        try:
+            await self.coordinator.client.set_hot_water(params)
+        except BSBLANError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key=error_translation_key,
+            ) from err
+        if refresh_config:
+            await self.slow_coordinator.async_refresh()
+        await self.coordinator.async_refresh_hot_water()
