@@ -579,6 +579,40 @@ async def test_water_heater_follows_current_setpoint(
 
 
 @pytest.mark.parametrize(
+    ("temperature", "expected_param"),
+    [
+        (45, SetHotWaterParam(reduced_setpoint=45)),
+        (55, SetHotWaterParam(nominal_setpoint=55)),
+    ],
+)
+async def test_set_temperature_with_equal_setpoints(
+    hass: HomeAssistant,
+    mock_bsblan: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    temperature: int,
+    expected_param: SetHotWaterParam,
+) -> None:
+    """Test equal setpoints can be lowered and raised again."""
+    mock_bsblan.hot_water_state.return_value.dhw_current_setpoint = MagicMock(
+        value=50.0
+    )
+    mock_bsblan.hot_water_config.return_value.reduced_setpoint = MagicMock(value=50.0)
+
+    await setup_with_selected_platforms(
+        hass, mock_config_entry, [Platform.WATER_HEATER]
+    )
+
+    await hass.services.async_call(
+        domain=WATER_HEATER_DOMAIN,
+        service=SERVICE_SET_TEMPERATURE,
+        service_data={ATTR_ENTITY_ID: ENTITY_ID, ATTR_TEMPERATURE: temperature},
+        blocking=True,
+    )
+
+    mock_bsblan.set_hot_water.assert_called_once_with(expected_param)
+
+
+@pytest.mark.parametrize(
     ("current_setpoint", "temperature", "translation_key"),
     [
         # Nominal in effect, below the reduced setpoint (35.0)

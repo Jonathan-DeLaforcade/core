@@ -639,6 +639,41 @@ async def test_set_temperature_writes_setpoint_in_effect(
     assert mock_bsblan.static_values.call_count == expected_static_calls
 
 
+@pytest.mark.parametrize(
+    ("temperature", "expected_call"),
+    [
+        (19.5, {"temp_reduced_setpoint": 19.5}),
+        (21.0, {"target_temperature": 21.0}),
+    ],
+)
+async def test_set_temperature_with_equal_setpoints(
+    hass: HomeAssistant,
+    mock_bsblan: AsyncMock,
+    mock_config_entry: MockConfigEntry,
+    temperature: float,
+    expected_call: dict[str, float],
+) -> None:
+    """Test equal setpoints can be lowered and raised again."""
+    mock_bsblan.state.return_value = _circuit_state(1, "20.0")
+    mock_bsblan.static_values.return_value = StaticState.model_validate(
+        {
+            "temp_reduced_setpoint": _temp_param("20.0"),
+            "heating_protective_setpoint": _temp_param("8.0"),
+            "comfort_setpoint_max": _temp_param("26.0"),
+        }
+    )
+    await setup_with_selected_platforms(hass, mock_config_entry, [Platform.CLIMATE])
+
+    await hass.services.async_call(
+        CLIMATE_DOMAIN,
+        SERVICE_SET_TEMPERATURE,
+        {ATTR_ENTITY_ID: ENTITY_ID, ATTR_TEMPERATURE: temperature},
+        blocking=True,
+    )
+
+    mock_bsblan.thermostat.assert_called_once_with(**expected_call, circuit=1)
+
+
 async def test_set_temperature_with_hvac_mode(
     hass: HomeAssistant,
     mock_bsblan: AsyncMock,
