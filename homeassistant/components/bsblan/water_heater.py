@@ -20,7 +20,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BSBLanConfigEntry, BSBLanData
 from .const import DOMAIN
 from .entity import BSBLanWaterHeaterDeviceEntity
-from .helpers import first_temperature, validate_setpoint_order
+from .helpers import first_temperature, validate_setpoint_order, writes_reduced_setpoint
 
 PARALLEL_UPDATES = 1
 
@@ -137,16 +137,6 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
         return first_temperature(dhw_config.reduced_setpoint)
 
     @property
-    def _reduced_setpoint_active(self) -> bool:
-        """Return whether the controller currently applies the reduced setpoint."""
-        current = first_temperature(self._dhw.dhw_current_setpoint)
-        return (
-            current is not None
-            and current != self._nominal_setpoint
-            and current == self._reduced_setpoint
-        )
-
-    @property
     @override
     def current_operation(self) -> str | None:
         """Return current operation."""
@@ -176,7 +166,12 @@ class BSBLANWaterHeater(BSBLanWaterHeaterDeviceEntity, WaterHeaterEntity):
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set the setpoint currently in effect."""
         temperature = kwargs[ATTR_TEMPERATURE]
-        reduced = self._reduced_setpoint_active
+        reduced = writes_reduced_setpoint(
+            temperature,
+            first_temperature(self._dhw.dhw_current_setpoint),
+            self._nominal_setpoint,
+            self._reduced_setpoint,
+        )
         self._validate_setpoint(temperature, reduced=reduced)
         await self._async_set_setpoint(temperature, reduced=reduced)
 

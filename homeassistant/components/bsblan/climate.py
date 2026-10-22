@@ -22,7 +22,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BSBLanConfigEntry, BSBLanData
 from .const import DOMAIN
 from .entity import BSBLanCircuitEntity
-from .helpers import first_temperature, validate_setpoint_order
+from .helpers import first_temperature, validate_setpoint_order, writes_reduced_setpoint
 
 PARALLEL_UPDATES = 1
 
@@ -244,12 +244,23 @@ class BSBLANClimate(BSBLanCircuitEntity, ClimateEntity):
         # Switching to heat or off leaves automatic mode, so the comfort
         # setpoint is the one to write
         reduced = hvac_mode in (None, HVACMode.AUTO) and (
-            self.preset_mode == PRESET_ECO
+            self._writes_reduced_setpoint(temperature)
         )
         self._validate_setpoint(temperature, reduced=reduced)
         if hvac_mode is not None:
             await self.async_set_hvac_mode(hvac_mode)
         await self._async_set_setpoint(temperature, reduced=reduced)
+
+    def _writes_reduced_setpoint(self, temperature: float) -> bool:
+        """Return whether a new target temperature goes to the reduced setpoint."""
+        if self._hvac_mode_value != BSBLAN_AUTOMATIC_MODE:
+            return self.preset_mode == PRESET_ECO
+        return writes_reduced_setpoint(
+            temperature,
+            first_temperature(self._circuit_state.current_setpoint),
+            self._comfort_setpoint,
+            self._reduced_setpoint,
+        )
 
     def _validate_setpoint(self, temperature: float, *, reduced: bool) -> None:
         """Keep the reduced setpoint at or below the comfort setpoint."""

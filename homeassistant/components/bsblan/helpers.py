@@ -41,6 +41,24 @@ def validate_setpoint_order(
     )
 
 
+def writes_reduced_setpoint(
+    temperature: float,
+    current: float | None,
+    comfort: float | None,
+    reduced: float | None,
+) -> bool:
+    """Return whether a new target goes to the reduced setpoint.
+
+    When both setpoints are equal, either one could be in effect. Only lowering
+    the reduced one or raising the comfort one keeps them in order.
+    """
+    if current is None or current != reduced:
+        return False
+    if current != comfort:
+        return True
+    return temperature < current
+
+
 async def async_sync_device_time(client: BSBLAN, device_name: str) -> None:
     """Synchronize BSB-LAN device time with Home Assistant.
 
