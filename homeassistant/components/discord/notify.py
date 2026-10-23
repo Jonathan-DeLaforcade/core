@@ -24,6 +24,7 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+ATTR_SILENT = "silent"
 ATTR_EMBED = "embed"
 ATTR_EMBED_AUTHOR = "author"
 ATTR_EMBED_COLOR = "color"
@@ -130,6 +131,12 @@ class DiscordNotificationService(BaseNotificationService):
 
         data = kwargs.get(ATTR_DATA) or {}
 
+        flags = (
+            nextcord.MessageFlags(suppress_notifications=True)
+            if data.get(ATTR_SILENT, False)
+            else None
+        )
+        
         embeds: list[nextcord.Embed] = []
         if ATTR_EMBED in data:
             embedding = data[ATTR_EMBED]
@@ -196,7 +203,7 @@ class DiscordNotificationService(BaseNotificationService):
                     except nextcord.NotFound:
                         _LOGGER.warning("Channel not found for ID: %s", channelid)
                         continue
-                await channel.send(message, files=files, embeds=embeds)
+                await channel.send(message, files=files, embeds=embeds, flags=flags)
         except (nextcord.HTTPException, nextcord.NotFound) as error:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
